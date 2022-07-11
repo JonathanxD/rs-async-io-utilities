@@ -10,12 +10,13 @@ use std::task::{Context, Poll};
 pub struct AsyncPrependReader<R: AsyncRead + Unpin> {
     inner: R,
     buffer: Vec<u8>,
+    take: Option<usize>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncPrependReader<R> {
     /// Constructs a new wrapper from an inner [`AsyncRead`] implementation.
     pub fn new(inner: R) -> Self {
-        Self { inner, buffer: Vec::new() }
+        Self { inner, buffer: Vec::new(), take: None }
     }
 
     /// Prepends data to this buffer.
@@ -42,6 +43,11 @@ impl<R: AsyncRead + Unpin> AsyncPrependReader<R> {
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.inner
     }
+
+    pub fn set_take(&mut self, n: usize) {
+        assert!(n > 0);
+        self.take = Some(n);
+    }
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for AsyncPrependReader<R> {
@@ -53,12 +59,34 @@ impl<R: AsyncRead + Unpin> AsyncRead for AsyncPrependReader<R> {
             buf.put_slice(&self.buffer[..end_index]);
             self.buffer = self.buffer.split_off(end_index);
         }
-    
-        let poll = Pin::new(&mut self.inner).poll_read(c, buf);
+
+        let mut filling_buffer = if let Some(n) = self.take {
+            buf.take(n)
+        } else {
+            buf.take(buf.remaining())
+        };
+
+        let poll = Pin::new(&mut self.inner).poll_read(c, &mut filling_buffer);
 
         if let Poll::Ready(Err(_)) = &poll {
             return poll;
-        } 
+        }
+
+        if let Poll::Ready(Ok(_)) = &poll {
+            if let Some(n) = self.take {
+                if filling_buffer.filled().len() >= n {
+                    self.take = None;
+                } else {
+                    let remaining = n - filling_buffer.filled().len();
+                    self.take = Some(remaining);
+                }
+            }
+
+            let filled = filling_buffer.filled().len();
+            let inited = filling_buffer.initialized().len();
+            unsafe { buf.assume_init(inited) };
+            buf.advance(filled);
+        }
 
         poll
     }
